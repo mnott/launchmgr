@@ -1,0 +1,907 @@
+#!/usr/local/bin/python3
+r"""
+# launchmgr
+
+A systemd-like service launcher for macOS login items.
+Launches apps in configurable tiers with delays after boot.
+
+## Overview
+
+`launchmgr` manages macOS application startup by organizing apps into tiers
+with configurable delays. A LaunchAgent runs `launchmgr start` at login,
+which launches apps tier by tier with absolute delays from boot time.
+
+## Configuration
+
+Config file: `~/.config/launchmgr/config.yaml`
+Log file: `~/.config/launchmgr/launch.log`
+
+### Config Structure
+
+```yaml
+tiers:
+  1:
+    delay: 30
+    name: "Menu Bar Apps"
+  2:
+    delay: 120
+    name: "Sync & Containers"
+  3:
+    delay: 300
+    name: "Heavy Sync"
+services:
+  myapp: {app: "MyApp", tier: 1, enabled: true}
+```
+
+Tier `delay` values are **absolute seconds from launch start**:
+- Tier 1 starts after 30s
+- Tier 2 starts after 120s (90s after tier 1)
+- Tier 3 starts after 300s (180s after tier 2)
+
+## Commands
+
+### start
+
+Launch services with tier delays.
+
+```
+launchmgr start [--tier N] [--service NAME] [--force] [--no-delay]
+```
+
+- No args: run all enabled tiers sequentially with configured delays
+- `--tier N`: start only that tier's services immediately (no delay)
+- `--service NAME`: start one service immediately
+- `--force`: bypass per-boot lock file
+- `--no-delay`: skip all tier delays for a full run
+
+A per-boot lock file at `/tmp/launchmgr-{boot_time}.lock` prevents double-runs
+on the same boot. Only the full start (no --tier/--service) creates/checks it.
+
+### stop
+
+Kill a running service by name.
+
+```
+launchmgr stop SERVICE
+```
+
+Finds the PID via `pgrep` and sends SIGTERM.
+
+### status
+
+Show a Rich table with columns: Tier | Service | App | Enabled | Running | PID | Delay
+
+```
+launchmgr status
+```
+
+Also shows lock file status at the bottom.
+
+### list
+
+List services grouped by tier with colored status dots.
+
+```
+launchmgr list
+```
+
+Green dot = enabled, red dot = disabled.
+
+### enable
+
+Enable a service in the config.
+
+```
+launchmgr enable SERVICE
+```
+
+### disable
+
+Disable a service in the config.
+
+```
+launchmgr disable SERVICE
+```
+
+### add
+
+Add a new service to the config.
+
+```
+launchmgr add NAME --tier N --app "App Name"
+```
+
+Creates the tier if it does not exist (default delay = tier_num * 60).
+
+### remove
+
+Remove a service from the config.
+
+```
+launchmgr remove SERVICE
+```
+
+### logs
+
+Show the launch log.
+
+```
+launchmgr logs [--tail N] [--follow]
+```
+
+Default: last 50 lines. `--follow` streams new lines with `tail -f`.
+
+### config
+
+Print config path, log path, and current config contents.
+
+```
+launchmgr config
+```
+
+### doc
+
+Re-generate this documentation as markdown.
+
+```
+launchmgr doc [--title TITLE] [--toc]
+```
+
+### install
+
+Install launchmgr to the system (run from the dev directory).
+
+```
+cd ~/Cloud/Development/scripts/dev.launchmgr
+./launchmgr install
+```
+
+Copies the binary to `/usr/local/bin/`, the LaunchAgent plist to
+`~/Library/LaunchAgents/`, and creates the default config if none exists.
+
+## Installation
+
+### Prerequisites
+
+```bash
+pip install -r requirements.txt
+# or
+pip install typer rich pyyaml doc2md
+```
+
+### Install
+
+```bash
+git clone <repo-url> dev.launchmgr
+cd dev.launchmgr
+./launchmgr install
+```
+
+This installs:
+
+| File | Destination |
+|------|-------------|
+| `launchmgr` | `/usr/local/bin/launchmgr` |
+| `org.mnsoft.launchmgr.plist` | `~/Library/LaunchAgents/org.mnsoft.launchmgr.plist` |
+| `config.yaml` | `~/.config/launchmgr/config.yaml` (only if missing) |
+
+The LaunchAgent is loaded automatically and will run `launchmgr start`
+at every login.
+"""
+
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import typer
+import yaml
+from rich import pretty, print, traceback
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+pretty.install()
+traceback.install()
+
+console = Console()
+
+app = typer.Typer(
+    name="launchmgr",
+    help="Systemd-like service launcher for macOS login items.",
+    add_completion=False,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".config" / "launchmgr"
+CONFIG_FILE = CONFIG_DIR / "config.yaml"
+LOG_FILE = CONFIG_DIR / "launch.log"
+
+DEFAULT_CONFIG: str = """\
+tiers:
+  1:
+    delay: 30
+    name: "Menu Bar Apps"
+  2:
+    delay: 120
+    name: "Sync & Containers"
+  3:
+    delay: 300
+    name: "Heavy Sync"
+services:
+  keycue: {app: "KeyCue", tier: 1, enabled: true}
+  rocket: {app: "Rocket", tier: 1, enabled: true}
+  textsniper: {app: "TextSniper", tier: 1, enabled: true}
+  maccy: {app: "Maccy", tier: 1, enabled: true}
+  supertab: {app: "SuperTab", tier: 1, enabled: true}
+  app-tamer: {app: "App Tamer", tier: 1, enabled: true}
+  ccc-dashboard: {app: "CCC Dashboard", tier: 1, enabled: true}
+  docker: {app: "Docker", tier: 2, enabled: true}
+  google-drive: {app: "Google Drive", tier: 2, enabled: true}
+  seafile: {app: "Seafile Client", tier: 3, enabled: true}
+"""
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+
+def _ensure_config() -> None:
+    """Create config directory and default config file if missing."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(DEFAULT_CONFIG)
+    if not LOG_FILE.exists():
+        LOG_FILE.touch()
+
+
+def _load_config() -> dict:
+    """Load and return the config as a dict."""
+    _ensure_config()
+    raw = yaml.safe_load(CONFIG_FILE.read_text()) or {}
+    # Normalise tier keys to int
+    if "tiers" in raw:
+        raw["tiers"] = {int(k): v for k, v in raw["tiers"].items()}
+    if "services" not in raw:
+        raw["services"] = {}
+    return raw
+
+
+def _save_config(cfg: dict) -> None:
+    """Serialise cfg back to YAML, preserving int tier keys."""
+    _ensure_config()
+    # yaml.dump handles int keys fine
+    CONFIG_FILE.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+
+
+def _log(msg: str) -> None:
+    """Append a timestamped line to the log file."""
+    _ensure_config()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with LOG_FILE.open("a") as fh:
+        fh.write(f"[{ts}] {msg}\n")
+
+
+def _get_boot_time() -> str:
+    """Return the epoch boot time as a string, parsed from sysctl kern.boottime."""
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # Output looks like: { sec = 1700000000, usec = 123456 } Tue Nov  14 ...
+        match = re.search(r"sec\s*=\s*(\d+)", result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return "0"
+
+
+def _lock_file() -> Path:
+    """Return the per-boot lock file path."""
+    boot_time = _get_boot_time()
+    return Path(f"/tmp/launchmgr-{boot_time}.lock")
+
+
+def _is_running(app_name: str) -> tuple[bool, Optional[int]]:
+    """
+    Check whether an app is running.
+
+    Uses `pgrep -if` to match the app name case-insensitively against the
+    full command line.  Returns (running, pid_or_None).
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-if", app_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            pids = result.stdout.strip().splitlines()
+            if pids:
+                return True, int(pids[0])
+    except Exception:
+        pass
+    return False, None
+
+
+def _launch_app(app_name: str) -> bool:
+    """Launch an app by name using `open -a`. Returns True on success."""
+    try:
+        subprocess.run(
+            ["open", "-a", app_name],
+            check=True,
+            capture_output=True,
+        )
+        return True
+    except subprocess.CalledProcessError as exc:
+        _log(f"ERROR launching '{app_name}': {exc.stderr.strip()}")
+        return False
+
+
+def _find_service(cfg: dict, name: str) -> Optional[str]:
+    """
+    Find a service key in cfg by:
+      1. Exact key match
+      2. Case-insensitive key match
+      3. Case-insensitive app name match
+
+    Returns the canonical key string, or None if not found.
+    """
+    services: dict = cfg.get("services", {})
+    # 1. Exact
+    if name in services:
+        return name
+    # 2. Case-insensitive key
+    lower = name.lower()
+    for key in services:
+        if key.lower() == lower:
+            return key
+    # 3. App name match
+    for key, svc in services.items():
+        if svc.get("app", "").lower() == lower:
+            return key
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def start(
+    services: Optional[list[str]] = typer.Argument(None, help="Service name(s) to start immediately."),
+    tier: Optional[int] = typer.Option(None, "--tier", "-t", help="Start only this tier immediately."),
+    force: bool = typer.Option(False, "--force", help="Bypass per-boot lock file."),
+    no_delay: bool = typer.Option(False, "--no-delay", help="Skip all tier delays for a full run."),
+) -> None:
+    """Start service(s), a tier, or all tiers (boot sequence).
+
+    \b
+    launchmgr start                  # Full boot sequence with delays
+    launchmgr start seafile docker   # Start specific services now
+    launchmgr start --tier 2         # Start a whole tier now
+    """
+    cfg = _load_config()
+
+    # --- Named service mode ---
+    if services:
+        for svc_name in services:
+            key = _find_service(cfg, svc_name)
+            if key is None:
+                console.print(f"[red]Service not found:[/red] {svc_name}")
+                continue
+            svc = cfg["services"][key]
+            app_name = svc["app"]
+            console.print(f"[cyan]Starting:[/cyan] {key} ({app_name})")
+            _log(f"Starting service '{key}' ({app_name})")
+            ok = _launch_app(app_name)
+            if ok:
+                console.print(f"  [green]Launched[/green] {app_name}")
+                _log(f"Launched '{app_name}' OK")
+            else:
+                console.print(f"  [red]Failed[/red] {app_name}")
+        return
+
+    # --- Single tier mode ---
+    if tier is not None:
+        tiers_cfg = cfg.get("tiers", {})
+        if tier not in tiers_cfg:
+            console.print(f"[red]Tier not found:[/red] {tier}")
+            raise typer.Exit(1)
+        tier_name = tiers_cfg[tier].get("name", f"Tier {tier}")
+        services_in_tier = {
+            k: v for k, v in cfg["services"].items()
+            if v.get("tier") == tier and v.get("enabled", False)
+        }
+        console.print(f"[cyan]Starting tier {tier}:[/cyan] {tier_name} ({len(services_in_tier)} services)")
+        _log(f"Starting tier {tier} ({tier_name}) immediately via --tier")
+        for key, svc in services_in_tier.items():
+            app_name = svc["app"]
+            console.print(f"  [dim]Launching[/dim] {app_name}...")
+            ok = _launch_app(app_name)
+            status = "OK" if ok else "FAILED"
+            _log(f"  {status}: '{app_name}'")
+            if ok:
+                console.print(f"  [green]OK[/green] {app_name}")
+            else:
+                console.print(f"  [red]FAILED[/red] {app_name}")
+        return
+
+    # --- Full run mode ---
+    lock = _lock_file()
+    if lock.exists() and not force:
+        console.print(
+            f"[yellow]Already ran this boot.[/yellow] Lock: {lock}\n"
+            "Use [bold]--force[/bold] to bypass."
+        )
+        _log("Skipping start: per-boot lock exists.")
+        return
+
+    # Create lock
+    lock.touch()
+    _log(f"Created per-boot lock: {lock}")
+
+    tiers_cfg = cfg.get("tiers", {})
+    sorted_tier_nums = sorted(tiers_cfg.keys())
+
+    console.print(f"[bold cyan]launchmgr start[/bold cyan] — {len(sorted_tier_nums)} tiers")
+    _log("Full start initiated.")
+
+    previous_delay = 0
+    start_epoch = time.monotonic()
+
+    for tier_num in sorted_tier_nums:
+        tier_info = tiers_cfg[tier_num]
+        tier_delay = int(tier_info.get("delay", 0))
+        tier_name = tier_info.get("name", f"Tier {tier_num}")
+
+        services_in_tier = {
+            k: v for k, v in cfg["services"].items()
+            if v.get("tier") == tier_num and v.get("enabled", False)
+        }
+
+        if not no_delay and tier_delay > 0:
+            sleep_secs = tier_delay - previous_delay
+            if sleep_secs > 0:
+                console.print(
+                    f"[dim]Waiting {sleep_secs}s before tier {tier_num} "
+                    f"({tier_name})...[/dim]"
+                )
+                _log(f"Sleeping {sleep_secs}s before tier {tier_num} ({tier_name})")
+                time.sleep(sleep_secs)
+
+        console.print(
+            f"\n[bold]Tier {tier_num}:[/bold] {tier_name} "
+            f"([cyan]{len(services_in_tier)} services[/cyan])"
+        )
+        _log(f"Launching tier {tier_num} ({tier_name})")
+
+        for key, svc in services_in_tier.items():
+            app_name = svc["app"]
+            console.print(f"  [dim]→[/dim] {app_name}")
+            ok = _launch_app(app_name)
+            status = "OK" if ok else "FAILED"
+            _log(f"  {status}: '{app_name}'")
+            if ok:
+                console.print(f"    [green]Launched[/green] {app_name}")
+            else:
+                console.print(f"    [red]Failed[/red] {app_name}")
+
+        previous_delay = tier_delay
+
+    elapsed = int(time.monotonic() - start_epoch)
+    console.print(f"\n[bold green]Done.[/bold green] All tiers launched in {elapsed}s.")
+    _log(f"Full start complete in {elapsed}s.")
+
+
+@app.command()
+def stop(
+    services: list[str] = typer.Argument(..., help="Service name(s) to stop."),
+    force: bool = typer.Option(False, "--force", "-f", help="Use SIGTERM instead of graceful quit."),
+) -> None:
+    """Stop running service(s). Uses AppleScript quit by default, --force for SIGTERM."""
+    cfg = _load_config()
+
+    for svc_name in services:
+        key = _find_service(cfg, svc_name)
+        if key is None:
+            console.print(f"[red]Service not found:[/red] {svc_name}")
+            continue
+
+        app_name = cfg["services"][key]["app"]
+        running, pid = _is_running(app_name)
+
+        if not running or pid is None:
+            console.print(f"[yellow]Not running:[/yellow] {app_name}")
+            continue
+
+        if force:
+            console.print(f"[cyan]Force-stopping[/cyan] {app_name} (PID {pid})...")
+            _log(f"Force-stopping '{app_name}' PID {pid}")
+            try:
+                os.kill(pid, signal.SIGTERM)
+                console.print(f"  [green]SIGTERM sent[/green] (PID {pid})")
+                _log(f"SIGTERM sent to PID {pid} ({app_name})")
+            except ProcessLookupError:
+                console.print(f"  [yellow]Already gone[/yellow]")
+            except PermissionError:
+                console.print(f"  [red]Permission denied[/red]")
+        else:
+            console.print(f"[cyan]Quitting[/cyan] {app_name}...")
+            _log(f"Quitting '{app_name}' via AppleScript")
+            result = subprocess.run(
+                ["osascript", "-e", f'tell application "{app_name}" to quit'],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                console.print(f"  [green]Quit sent[/green]")
+                _log(f"AppleScript quit sent to '{app_name}'")
+            else:
+                console.print(f"  [yellow]AppleScript failed, sending SIGTERM...[/yellow]")
+                _log(f"AppleScript quit failed for '{app_name}': {result.stderr.strip()}")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    console.print(f"  [green]SIGTERM sent[/green] (PID {pid})")
+                except (ProcessLookupError, PermissionError) as exc:
+                    console.print(f"  [red]Failed:[/red] {exc}")
+
+
+@app.command()
+def status() -> None:
+    """Show a Rich table of all services with running status."""
+    cfg = _load_config()
+    tiers_cfg = cfg.get("tiers", {})
+
+    table = Table(
+        title="launchmgr service status",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Tier", style="dim", justify="right")
+    table.add_column("Service")
+    table.add_column("App")
+    table.add_column("Enabled", justify="center")
+    table.add_column("Running", justify="center")
+    table.add_column("PID", justify="right")
+    table.add_column("Delay", justify="right")
+
+    sorted_tier_nums = sorted(tiers_cfg.keys())
+
+    for tier_num in sorted_tier_nums:
+        tier_info = tiers_cfg[tier_num]
+        tier_name = tier_info.get("name", f"Tier {tier_num}")
+        tier_delay = tier_info.get("delay", "?")
+
+        services_in_tier = {
+            k: v for k, v in cfg["services"].items()
+            if v.get("tier") == tier_num
+        }
+
+        for key, svc in sorted(services_in_tier.items()):
+            app_name = svc.get("app", key)
+            enabled = svc.get("enabled", False)
+            running, pid = _is_running(app_name)
+
+            enabled_text = Text("yes", style="green") if enabled else Text("no", style="red")
+            running_text = Text("yes", style="green bold") if running else Text("no", style="dim")
+            pid_text = str(pid) if pid else "-"
+
+            table.add_row(
+                f"{tier_num} · {tier_name}",
+                key,
+                app_name,
+                enabled_text,
+                running_text,
+                pid_text,
+                f"{tier_delay}s",
+            )
+
+    console.print(table)
+
+    # Lock file status
+    lock = _lock_file()
+    if lock.exists():
+        mtime = datetime.fromtimestamp(lock.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        console.print(f"\n[green]Lock file present:[/green] {lock} (created {mtime})")
+    else:
+        console.print(f"\n[dim]No lock file found at {lock}[/dim]")
+
+
+@app.command(name="list")
+def list_services() -> None:
+    """List services grouped by tier with colored status dots."""
+    cfg = _load_config()
+    tiers_cfg = cfg.get("tiers", {})
+
+    sorted_tier_nums = sorted(tiers_cfg.keys())
+
+    for tier_num in sorted_tier_nums:
+        tier_info = tiers_cfg[tier_num]
+        tier_name = tier_info.get("name", f"Tier {tier_num}")
+        tier_delay = tier_info.get("delay", "?")
+
+        console.print(
+            f"\n[bold cyan]Tier {tier_num}[/bold cyan] — {tier_name} "
+            f"[dim](delay: {tier_delay}s)[/dim]"
+        )
+
+        services_in_tier = {
+            k: v for k, v in cfg["services"].items()
+            if v.get("tier") == tier_num
+        }
+
+        if not services_in_tier:
+            console.print("  [dim](no services)[/dim]")
+            continue
+
+        for key in sorted(services_in_tier.keys()):
+            svc = services_in_tier[key]
+            enabled = svc.get("enabled", False)
+            app_name = svc.get("app", key)
+            dot = "[green]●[/green]" if enabled else "[red]●[/red]"
+            console.print(f"  {dot} [bold]{key}[/bold]  [dim]{app_name}[/dim]")
+
+    # Services with no matching tier
+    orphans = {
+        k: v for k, v in cfg["services"].items()
+        if v.get("tier") not in tiers_cfg
+    }
+    if orphans:
+        console.print("\n[yellow]Orphaned services (tier not defined):[/yellow]")
+        for key, svc in orphans.items():
+            console.print(f"  [yellow]?[/yellow] {key}  ({svc.get('app', key)})")
+
+
+@app.command()
+def enable(
+    services: list[str] = typer.Argument(..., help="Service name(s) to enable."),
+) -> None:
+    """Enable service(s) in the config."""
+    cfg = _load_config()
+    for svc_name in services:
+        key = _find_service(cfg, svc_name)
+        if key is None:
+            console.print(f"[red]Service not found:[/red] {svc_name}")
+            continue
+        cfg["services"][key]["enabled"] = True
+        console.print(f"[green]Enabled:[/green] {key}")
+        _log(f"Enabled service '{key}'")
+    _save_config(cfg)
+
+
+@app.command()
+def disable(
+    services: list[str] = typer.Argument(..., help="Service name(s) to disable."),
+) -> None:
+    """Disable service(s) in the config."""
+    cfg = _load_config()
+    for svc_name in services:
+        key = _find_service(cfg, svc_name)
+        if key is None:
+            console.print(f"[red]Service not found:[/red] {svc_name}")
+            continue
+        cfg["services"][key]["enabled"] = False
+        console.print(f"[yellow]Disabled:[/yellow] {key}")
+        _log(f"Disabled service '{key}'")
+    _save_config(cfg)
+
+
+@app.command()
+def add(
+    name: str = typer.Argument(..., help="Service key name (slug)."),
+    tier: int = typer.Option(..., "--tier", "-t", help="Tier number to assign."),
+    app_name: str = typer.Option(..., "--app", "-a", help='App name for `open -a`.'),
+) -> None:
+    """Add a new service to the config. Creates the tier if it does not exist."""
+    cfg = _load_config()
+
+    if name in cfg.get("services", {}):
+        console.print(f"[red]Service already exists:[/red] {name}")
+        raise typer.Exit(1)
+
+    # Create tier if missing
+    if tier not in cfg.get("tiers", {}):
+        default_delay = tier * 60
+        cfg.setdefault("tiers", {})[tier] = {
+            "delay": default_delay,
+            "name": f"Tier {tier}",
+        }
+        console.print(
+            f"[cyan]Created tier {tier}[/cyan] with default delay {default_delay}s."
+        )
+        _log(f"Created tier {tier} with delay {default_delay}s")
+
+    cfg.setdefault("services", {})[name] = {
+        "app": app_name,
+        "tier": tier,
+        "enabled": True,
+    }
+    _save_config(cfg)
+    console.print(f"[green]Added service:[/green] {name} ({app_name}) in tier {tier}")
+    _log(f"Added service '{name}' app='{app_name}' tier={tier}")
+
+
+@app.command()
+def remove(
+    services: list[str] = typer.Argument(..., help="Service name(s) to remove."),
+) -> None:
+    """Remove service(s) from the config."""
+    cfg = _load_config()
+    for svc_name in services:
+        key = _find_service(cfg, svc_name)
+        if key is None:
+            console.print(f"[red]Service not found:[/red] {svc_name}")
+            continue
+        app_name = cfg["services"][key].get("app", key)
+        del cfg["services"][key]
+        console.print(f"[green]Removed:[/green] {key} ({app_name})")
+        _log(f"Removed service '{key}' ({app_name})")
+    _save_config(cfg)
+
+
+@app.command()
+def logs(
+    tail: int = typer.Option(50, "--tail", "-n", help="Number of lines to show."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Stream new log lines."),
+) -> None:
+    """Show the launch log. Use --follow to stream new entries."""
+    _ensure_config()
+
+    if follow:
+        console.print(f"[dim]Following {LOG_FILE} (Ctrl+C to stop)...[/dim]\n")
+        try:
+            subprocess.run(["tail", f"-{tail}", "-f", str(LOG_FILE)])
+        except KeyboardInterrupt:
+            pass
+        return
+
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0:
+        console.print("[dim]Log file is empty.[/dim]")
+        return
+
+    lines = LOG_FILE.read_text().splitlines()
+    shown = lines[-tail:] if len(lines) > tail else lines
+    for line in shown:
+        console.print(line)
+
+
+@app.command(name="config")
+def show_config() -> None:
+    """Print config path, log path, and current config contents."""
+    _ensure_config()
+    console.print(f"[bold]Config file:[/bold] {CONFIG_FILE}")
+    console.print(f"[bold]Log file:[/bold]    {LOG_FILE}\n")
+    contents = CONFIG_FILE.read_text()
+    console.print("[bold cyan]--- config.yaml ---[/bold cyan]")
+    console.print(contents)
+
+
+@app.command()
+def install() -> None:
+    """Install launchmgr to the system. Run from the dev directory."""
+    import shutil
+
+    source_dir = Path(__file__).resolve().parent
+    plist_src = source_dir / "org.mnsoft.launchmgr.plist"
+    script_src = Path(__file__).resolve()
+    config_src = source_dir / "config.yaml"
+
+    # Destinations
+    bin_dst = Path("/usr/local/bin/launchmgr")
+    plist_dst = Path.home() / "Library" / "LaunchAgents" / "org.mnsoft.launchmgr.plist"
+    config_dst = CONFIG_DIR / "config.yaml"
+
+    if not plist_src.exists():
+        console.print(
+            "[red]Error:[/red] org.mnsoft.launchmgr.plist not found.\n"
+            f"Expected at: {plist_src}\n"
+            "Run [cyan]./launchmgr install[/cyan] from the dev directory."
+        )
+        raise typer.Exit(1)
+
+    # 1. Copy binary (skip if same file, e.g. hardlink or symlink)
+    if script_src.samefile(bin_dst) if bin_dst.exists() else False:
+        console.print(f"[dim]Binary:[/dim]      {bin_dst} (already current)")
+    else:
+        console.print(f"[cyan]Binary:[/cyan]      {script_src} → {bin_dst}")
+        shutil.copy2(str(script_src), str(bin_dst))
+    bin_dst.chmod(0o755)
+
+    # 2. Config directory + default config
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if config_src.exists() and not config_dst.exists():
+        console.print(f"[cyan]Config:[/cyan]      {config_src} → {config_dst}")
+        shutil.copy2(str(config_src), str(config_dst))
+    elif config_dst.exists():
+        console.print(f"[dim]Config:[/dim]      {config_dst} (already exists, kept)")
+    else:
+        # No source config and no existing config — write defaults
+        _ensure_config()
+        console.print(f"[cyan]Config:[/cyan]      created defaults at {config_dst}")
+
+    # 3. Unload old LaunchAgent if present
+    uid = os.getuid()
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}/org.mnsoft.launchmgr"],
+        capture_output=True,
+    )
+
+    # 4. Copy plist
+    plist_dst.parent.mkdir(parents=True, exist_ok=True)
+    console.print(f"[cyan]LaunchAgent:[/cyan] {plist_src} → {plist_dst}")
+    shutil.copy2(str(plist_src), str(plist_dst))
+
+    # 5. Load LaunchAgent
+    result = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(plist_dst)],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        console.print("[green]LaunchAgent loaded.[/green]")
+    else:
+        console.print(f"[yellow]LaunchAgent:[/yellow] {result.stderr.strip()}")
+
+    console.print(f"\n[bold green]Installed.[/bold green]")
+    console.print(f"  Binary:      {bin_dst}")
+    console.print(f"  Config:      {config_dst}")
+    console.print(f"  LaunchAgent: {plist_dst}")
+    console.print(f"  Log:         {LOG_FILE}")
+    _log("launchmgr installed")
+
+
+@app.command()
+def doc(
+    ctx: typer.Context,
+    title: str = typer.Option(None, help="The title of the document"),
+    toc: bool = typer.Option(False, help="Whether to create a table of contents"),
+) -> None:
+    """Re-create the documentation and write it to the output file."""
+    import importlib
+    import importlib.util
+
+    import doc2md
+
+    def import_path(path):
+        module_name = os.path.basename(path).replace("-", "_")
+        spec = importlib.util.spec_from_loader(
+            module_name,
+            importlib.machinery.SourceFileLoader(module_name, path),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[module_name] = module
+        return module
+
+    mod_name = os.path.basename(__file__)
+    if mod_name.endswith(".py"):
+        mod_name = mod_name.rsplit(".py", 1)[0]
+    atitle = title or mod_name.replace("_", "-")
+    module = import_path(__file__)
+    docstr = module.__doc__
+    result = doc2md.doc2md(docstr, atitle, toc=toc, min_level=0)
+    print(result)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    try:
+        app()
+    except SystemExit as e:
+        if e.code != 0:
+            raise

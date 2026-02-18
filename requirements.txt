@@ -1,0 +1,4 @@
+typer>=0.15.0
+rich>=13.0.0
+pyyaml>=6.0
+doc2md>=0.1.0
