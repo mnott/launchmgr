@@ -9,24 +9,12 @@ tiers:
     delay: 300
     name: Heavy Sync
 services:
-  keycue:
-    app: KeyCue
-    tier: 1
-    enabled: true
-  rocket:
-    app: Rocket
-    tier: 1
-    enabled: true
   textsniper:
     app: TextSniper
     tier: 1
     enabled: true
   maccy:
     app: Maccy
-    tier: 1
-    enabled: true
-  supertab:
-    app: SuperTab
     tier: 1
     enabled: true
   app-tamer:
@@ -39,10 +27,6 @@ services:
     enabled: true
   docker:
     app: Docker
-    tier: 2
-    enabled: true
-  google-drive:
-    app: Google Drive
     tier: 2
     enabled: true
   seafile:

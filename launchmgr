@@ -863,6 +863,240 @@ def install() -> None:
 
 
 @app.command()
+def uninstall(
+    purge: bool = typer.Option(False, "--purge", help="Also remove ~/.config/launchmgr/ (config + logs)."),
+) -> None:
+    """Uninstall launchmgr from the system (reverse of install).
+
+    \b
+    launchmgr uninstall           # Remove binary, plist, lock/log files; keep config
+    launchmgr uninstall --purge   # Also remove ~/.config/launchmgr/
+    """
+    uid = os.getuid()
+    removed: list[str] = []
+    skipped: list[str] = []
+
+    # 1. Stop all running managed services via AppleScript quit
+    console.print("[bold cyan]Stopping running services...[/bold cyan]")
+    try:
+        cfg = _load_config()
+        for key, svc in cfg.get("services", {}).items():
+            app_name = svc.get("app", key)
+            running, pid = _is_running(app_name)
+            if running:
+                console.print(f"  [cyan]Quitting[/cyan] {app_name}...")
+                result = subprocess.run(
+                    ["osascript", "-e", f'tell application "{app_name}" to quit'],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    console.print(f"    [green]Quit sent[/green]")
+                else:
+                    # Fallback to SIGTERM
+                    if pid is not None:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            console.print(f"    [green]SIGTERM sent[/green] (PID {pid})")
+                        except (ProcessLookupError, PermissionError) as exc:
+                            console.print(f"    [yellow]Could not stop:[/yellow] {exc}")
+    except Exception as exc:
+        console.print(f"  [yellow]Could not read config to stop services:[/yellow] {exc}")
+
+    # Log uninstall before removing the log file
+    _log("launchmgr uninstall initiated")
+
+    # 2. Unload the LaunchAgent
+    console.print("\n[bold cyan]Unloading LaunchAgent...[/bold cyan]")
+    result = subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}/org.mnsoft.launchmgr"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        console.print("  [green]LaunchAgent unloaded.[/green]")
+    else:
+        console.print(f"  [dim]LaunchAgent not loaded or already removed.[/dim]")
+
+    # 3. Remove plist
+    plist_path = Path.home() / "Library" / "LaunchAgents" / "org.mnsoft.launchmgr.plist"
+    if plist_path.exists():
+        plist_path.unlink()
+        console.print(f"  [green]Removed:[/green] {plist_path}")
+        removed.append(str(plist_path))
+    else:
+        console.print(f"  [dim]Not found:[/dim] {plist_path}")
+        skipped.append(str(plist_path))
+
+    # 4. Remove stdout/stderr logs
+    for log_path in [Path("/tmp/launchmgr-stdout.log"), Path("/tmp/launchmgr-stderr.log")]:
+        if log_path.exists():
+            log_path.unlink()
+            console.print(f"  [green]Removed:[/green] {log_path}")
+            removed.append(str(log_path))
+
+    # 5. Remove lock files
+    import glob as _glob
+    lock_files = _glob.glob("/tmp/launchmgr-*.lock")
+    for lf in lock_files:
+        Path(lf).unlink(missing_ok=True)
+        console.print(f"  [green]Removed lock:[/green] {lf}")
+        removed.append(lf)
+
+    # 6. Purge config dir if requested
+    if purge:
+        import shutil as _shutil
+        if CONFIG_DIR.exists():
+            _shutil.rmtree(str(CONFIG_DIR))
+            console.print(f"  [green]Purged:[/green] {CONFIG_DIR}")
+            removed.append(str(CONFIG_DIR))
+        else:
+            console.print(f"  [dim]Config dir not found:[/dim] {CONFIG_DIR}")
+    else:
+        console.print(f"\n[dim]Config preserved at {CONFIG_DIR} (use --purge to remove).[/dim]")
+
+    # 7. Remove binary — detect if we're running from it
+    bin_path = Path("/usr/local/bin/launchmgr")
+    self_path = Path(__file__).resolve()
+    if bin_path.exists():
+        running_from_bin = False
+        try:
+            running_from_bin = self_path.samefile(bin_path)
+        except Exception:
+            pass
+
+        if running_from_bin:
+            # Schedule removal via a background shell command
+            console.print(
+                f"\n  [yellow]Note:[/yellow] Running from {bin_path}. "
+                "Binary will be removed now."
+            )
+            subprocess.Popen(
+                ["sh", "-c", f"sleep 1 && rm -f {bin_path}"],
+                start_new_session=True,
+            )
+            console.print(f"  [green]Scheduled removal:[/green] {bin_path}")
+            removed.append(str(bin_path))
+        else:
+            bin_path.unlink()
+            console.print(f"  [green]Removed:[/green] {bin_path}")
+            removed.append(str(bin_path))
+    else:
+        console.print(f"  [dim]Not found:[/dim] {bin_path}")
+        skipped.append(str(bin_path))
+
+    # Summary
+    console.print(f"\n[bold green]Uninstall complete.[/bold green]")
+    if removed:
+        console.print(f"  Removed {len(removed)} item(s):")
+        for item in removed:
+            console.print(f"    [dim]-[/dim] {item}")
+    if skipped:
+        console.print(f"  Skipped (not found): {len(skipped)} item(s)")
+
+
+@app.command()
+def tier(
+    tier_num: Optional[int] = typer.Argument(None, help="Tier number to inspect or edit."),
+    delay: Optional[int] = typer.Option(None, "--delay", "-d", help="Set delay (seconds) for this tier."),
+    name: Optional[str] = typer.Option(None, "--name", "-n", help="Set name for this tier."),
+) -> None:
+    """Show or edit tier delays and names.
+
+    \b
+    launchmgr tier                      # Table of all tiers
+    launchmgr tier 2                    # Details for tier 2
+    launchmgr tier 2 --delay 90         # Set delay for tier 2
+    launchmgr tier 2 --name "My Apps"   # Set name for tier 2
+    launchmgr tier 2 --delay 90 --name "My Apps"
+    """
+    cfg = _load_config()
+    tiers_cfg = cfg.get("tiers", {})
+    services_cfg = cfg.get("services", {})
+
+    # Count services per tier
+    def _services_in_tier(t: int) -> int:
+        return sum(1 for svc in services_cfg.values() if svc.get("tier") == t)
+
+    # --- No tier number: show all tiers ---
+    if tier_num is None:
+        table = Table(
+            title="launchmgr tiers",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Tier", style="dim", justify="right")
+        table.add_column("Name")
+        table.add_column("Delay (s)", justify="right")
+        table.add_column("Services", justify="right")
+
+        for t in sorted(tiers_cfg.keys()):
+            info = tiers_cfg[t]
+            table.add_row(
+                str(t),
+                info.get("name", f"Tier {t}"),
+                str(info.get("delay", "?")),
+                str(_services_in_tier(t)),
+            )
+
+        console.print(table)
+        return
+
+    # --- Tier number given but no options: show details ---
+    if delay is None and name is None:
+        if tier_num not in tiers_cfg:
+            console.print(f"[red]Tier not found:[/red] {tier_num}")
+            raise typer.Exit(1)
+        info = tiers_cfg[tier_num]
+        console.print(f"[bold cyan]Tier {tier_num}[/bold cyan]")
+        console.print(f"  Name:     {info.get('name', f'Tier {tier_num}')}")
+        console.print(f"  Delay:    {info.get('delay', '?')}s")
+        console.print(f"  Services: {_services_in_tier(tier_num)}")
+        return
+
+    # --- Tier number + options: update or create ---
+    if tier_num not in tiers_cfg:
+        if delay is not None and name is not None:
+            # Create new tier
+            tiers_cfg[tier_num] = {"delay": delay, "name": name}
+            cfg["tiers"] = tiers_cfg
+            _save_config(cfg)
+            console.print(
+                f"[green]Created tier {tier_num}:[/green] "
+                f"name='{name}' delay={delay}s"
+            )
+            _log(f"Created tier {tier_num} name='{name}' delay={delay}s")
+        else:
+            console.print(
+                f"[red]Tier {tier_num} does not exist.[/red] "
+                "Provide both --delay and --name to create it."
+            )
+            raise typer.Exit(1)
+        return
+
+    # Update existing tier
+    info = tiers_cfg[tier_num]
+    changes: list[str] = []
+
+    if delay is not None:
+        old_delay = info.get("delay", "?")
+        info["delay"] = delay
+        changes.append(f"delay {old_delay}s → {delay}s")
+        _log(f"Tier {tier_num}: delay changed {old_delay}s → {delay}s")
+
+    if name is not None:
+        old_name = info.get("name", f"Tier {tier_num}")
+        info["name"] = name
+        changes.append(f"name '{old_name}' → '{name}'")
+        _log(f"Tier {tier_num}: name changed '{old_name}' → '{name}'")
+
+    tiers_cfg[tier_num] = info
+    cfg["tiers"] = tiers_cfg
+    _save_config(cfg)
+    console.print(
+        f"[green]Updated tier {tier_num}:[/green] " + ", ".join(changes)
+    )
+
+
+@app.command()
 def doc(
     ctx: typer.Context,
     title: str = typer.Option(None, help="The title of the document"),
